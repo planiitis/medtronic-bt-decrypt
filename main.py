@@ -53,21 +53,17 @@ class SeqCrypt:
 
     def __post_init__(self):
         self.logger = logging.getLogger(type(self).__name__)
-
-    def ctr_nonce(self):
-        nonce = self.seq.to_bytes(length=5, byteorder="big") + self.nonce
-        assert len(nonce) == 13
-        return nonce
+        if len(self.nonce) != 8:
+            raise ValueError
 
     def decrypt(self, msg):
         log = self.logger.getChild("decrypt")
         if len(msg) < 3:
             raise ValueError
-        seq = msg[-3] * 2
-        d = (seq - self.seq // 2) & 0xFF
-        seq = self.seq + d * 2
+        d = (msg[-3] - self.seq // 2) & 0xFF
+        seq = self.seq + 2 * d
         log.debug(f"{seq = }")
-        nonce = self.ctr_nonce()
+        nonce = seq.to_bytes(length=5, byteorder="big") + self.nonce
         cobj = CMAC.new(self.key, ciphermod=AES, mac_len=4)
         ciphertext = msg[:-3]
         log.debug(f"{ciphertext.hex() = }")
