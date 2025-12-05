@@ -32,17 +32,20 @@ class KeyDatabase:
     local_device_type: int
     remote_devices: dict[int, StaticKeys]
 
-    @staticmethod
-    def from_bytes(data: bytes):
+    @classmethod
+    def from_bytes(cls, data: bytes):
+        log = logging.getLogger(cls.__name__).getChild("from_bytes")
         n = data[5]
         if len(data) != 6 + 81 * n:
             raise ValueError
-        t = data[4]
-        m = {}
+        local_device_type = data[4]
+        log.debug(f"{local_device_type = }")
+        remote_devices = {}
         for i in range(n):
             p = 6 + 81 * i
-            m[data[p]] = StaticKeys.from_bytes(data[p + 1 : p + 81])
-        return KeyDatabase(local_device_type=t, remote_devices=m)
+            remote_devices[data[p]] = StaticKeys.from_bytes(data[p + 1 : p + 81])
+        log.debug(f"{remote_devices.keys() = }")
+        return cls(local_device_type=local_device_type, remote_devices=remote_devices)
 
 
 @dataclass
