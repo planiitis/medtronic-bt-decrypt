@@ -79,14 +79,18 @@ class SeqCrypt:
 
 @dataclass
 class Session:
-    key_database: KeyDatabase
+    client_key_database: KeyDatabase | None = None
+    server_key_database: KeyDatabase | None = None
     client_key_material: bytes | None = None
     client_nonce: bytes | None = None
     client_device_type: int | None = None
     server_device_type: int | None = None
     server_key_material: bytes | None = None
     server_nonce: bytes | None = None
-    static_keys: StaticKeys | None = None
+    client_static_keys: StaticKeys | None = None
+    server_static_keys: StaticKeys | None = None
+    derivation_key: bytes | None = None
+    handshake_auth_key: bytes | None = None
     client_crypt: SeqCrypt | None = None
     server_crypt: SeqCrypt | None = None
 
@@ -99,14 +103,28 @@ class Session:
         if msg[1] != 1:
             raise ValueError
         self.server_device_type = msg[0]
-        self.static_keys = self.key_database.remote_devices[self.server_device_type]
 
     def handshake_1_c(self, msg: bytes):
         if len(msg) != 20:
             raise ValueError
         self.client_key_material = msg[:8]
         self.client_nonce = msg[9:13]
-        self.client_device_type = msg[8]
+        cdt = self.client_device_type = msg[8]
+        sdt = self.server_device_type
+        sk = None
+        ckd = self.client_key_database
+        skd = self.server_key_database
+        if ckd is None and skd is None:
+            raise ValueError("No key database available.")
+        if ckd is not None and ckd.local_device_type == cdt:
+            sk = self.client_static_keys = ckd.remote_devices.get(sdt)
+        if skd is not None and skd.local_device_type == sdt:
+            sk = self.server_static_keys = skd.remote_devices.get(cdt)
+        if sk is None:
+            raise KeyError(f"No keys available for client device type {cdt} and server device type {sdt}.")
+        self.derivation_key = sk.derivation_key
+        self.handshake_auth_key = sk.handshake_auth_key
+
 
     def handshake_2_s(self, msg: bytes):
         if len(msg) != 20:
@@ -116,8 +134,8 @@ class Session:
         auth = auth8(
             self.client_key_material,
             server_key_material,
-            self.static_keys.derivation_key,
-            self.static_keys.handshake_auth_key,
+            self.derivation_key,
+            self.handshake_auth_key,
         )
         received = msg[0:8]
         auth.verify(received)
@@ -131,13 +149,13 @@ class Session:
         auth1 = auth8(
             self.client_key_material,
             self.server_key_material,
-            self.static_keys.derivation_key,
-            self.static_keys.handshake_auth_key,
+            self.derivation_key,
+            self.handshake_auth_key,
         )
         inner = (
-            auth1.digest() + self.server_key_material + self.static_keys.derivation_key
+            auth1.digest() + self.server_key_material + self.derivation_key
         )
-        auth2 = CMAC.new(self.static_keys.handshake_auth_key, ciphermod=AES, mac_len=8)
+        auth2 = CMAC.new(self.handshake_auth_key, ciphermod=AES, mac_len=8)
         auth2.update(inner)
         received = msg[:8]
         auth2.verify(received)
@@ -147,7 +165,7 @@ class Session:
         log = self.logger.getChild("handshake_4_s")
         if len(msg) != 20:
             raise ValueError
-        key = AES.new(self.static_keys.derivation_key, AES.MODE_ECB).encrypt(
+        key = AES.new(self.derivation_key, AES.MODE_ECB).encrypt(
             self.server_key_material + self.client_key_material
         )
         nonce = self.client_nonce + self.server_nonce
@@ -156,39 +174,43 @@ class Session:
         self.server_crypt = SeqCrypt(key=key, nonce=nonce, seq=1)
         inner = self.server_crypt.decrypt(msg)[:16]
         log.debug(f"{inner.hex() = }")
-        plain = AES.new(self.static_keys.permit_decrypt_key, AES.MODE_ECB).decrypt(
-            inner
-        )
-        auth = CMAC.new(self.static_keys.permit_auth_key, ciphermod=AES, mac_len=4)
-        auth.update(plain[:12])
-        log.debug(f"{plain[:12].hex() = }")
-        log.debug(f"{plain[12:].hex() = }")
-        auth.verify(plain[12:])
-        if plain[0] == 0 and plain[1] == self.server_device_type:
-            log.info("server device type match")
+        self.check_payload(inner, self.client_static_keys, self.server_static_keys, self.server_device_type)
 
     def handshake_5_c(self, msg: bytes):
         log = self.logger.getChild("handshake_5_c")
         if len(msg) != 20:
             raise ValueError
-        plain = self.client_crypt.decrypt(msg)[:-1]
-        log.debug(f"{plain.hex() = }")
-        log.debug(f"{self.static_keys.handshake_payload.hex() = }")
-        if plain == self.static_keys.handshake_payload:
-            log.info("handshake payload match")
-        experiment = AES.new(self.static_keys.permit_decrypt_key, AES.MODE_ECB).decrypt(
-            plain
-        )
-        log.debug(f"{experiment.hex() = }")
+        inner = self.client_crypt.decrypt(msg)[:-1]
+        log.debug(f"{inner.hex() = }")
+        self.check_payload(inner, self.server_static_keys, self.client_static_keys, self.client_device_type)
+
+    def check_payload(self, payload, verifier_static_keys, prover_static_keys, prover_device_type):
+        log = self.logger.getChild("check_payload")
+        if prover_static_keys is not None:
+            log.debug(f"{payload.hex() = }")
+            log.debug(f"{prover_static_keys.handshake_payload.hex() = }")
+            if payload == prover_static_keys.handshake_payload:
+                log.info("handshake payload match")
+        if verifier_static_keys is not None:
+            plain = AES.new(verifier_static_keys.permit_decrypt_key, AES.MODE_ECB).decrypt(
+                payload
+            )
+            auth = CMAC.new(verifier_static_keys.permit_auth_key, ciphermod=AES, mac_len=4)
+            auth.update(plain[:12])
+            log.debug(f"{plain[:12].hex() = }")
+            log.debug(f"{plain[12:].hex() = }")
+            auth.verify(plain[12:])
+            if plain[0] == 0 and plain[1] == prover_device_type:
+                log.info("prover device type match")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
+
     kdbdata = bytes.fromhex(
         "5fe5928308010230f0b50df613f2e429c8c5e8713854add1a69b837235a3e974304d8055ccb397838b90823c73236d6a83dcc9db3a2a939ff16145ca4169ef93a7fa39b20962b05e57413bff8b3d61fce0dfef2c43b326"
     )
-
-    sess = Session(key_database=KeyDatabase.from_bytes(kdbdata))
+    sess = Session(client_key_database=KeyDatabase.from_bytes(kdbdata))
     sess.handshake_0_s(bytes.fromhex("02015f0edcd0c2af98705bed6c8172856d860402"))
     sess.handshake_1_c(bytes.fromhex("a579868377f401ae083405ef88cc0962d6079a04"))
     sess.handshake_2_s(bytes.fromhex("77f3fb85b079310455fd8f47ddaf81ab49defc7b"))
